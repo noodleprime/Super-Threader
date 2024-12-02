@@ -14,5 +14,15 @@ public class SuperThreader : ModuleRules
                 "Engine"
             }
         );
+
+        if (Target.bBuildEditor)
+        {
+            PrivateDependencyModuleNames.AddRange(
+                new string[]
+                {
+                    "UnrealEd"
+                }
+            );
+        }
     }
 }

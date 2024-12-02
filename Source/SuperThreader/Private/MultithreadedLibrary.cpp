@@ -1,234 +1,110 @@
 #include "MultithreadedLibrary.h"
-#include "SuperThreaderModule.h"
-#include "Engine/World.h"
-#include "HAL/ThreadManager.h"
-#include "HAL/RunnableThread.h"
-#include "Misc/ScopeLock.h"
 
-DECLARE_LOG_CATEGORY_EXTERN(LogSuperThreader, Log, All);
-DEFINE_LOG_CATEGORY(LogSuperThreader);
+DEFINE_LOG_CATEGORY_STATIC(LogSuperThreader, Log, All);
 
-TMap<int64, FEnhancedMultithreadedTask*> UMultithreadedLibrary::ActiveThreads;
-FCriticalSection UMultithreadedLibrary::ThreadMapCriticalSection;
+TMap<int32, UMultithreadedLibrary::FTaskInfo> UMultithreadedLibrary::ActiveTasks;
+FCriticalSection UMultithreadedLibrary::TaskLock;
+bool UMultithreadedLibrary::bIsInitialized = false;
 
-FEnhancedMultithreadedTask::FEnhancedMultithreadedTask(const FThreadWorkDelegate& InWorkDelegate, bool bInRunOnce)
-    : WorkDelegate(InWorkDelegate)
-    , Thread(nullptr)
-    , StopRequestedCounter(0)
-    , RunningCounter(0)
-    , bShuttingDown(false)
-    , bRunOnce(bInRunOnce)
-    , LastExecutionTime(0.0)
+void FSuperThreadTask::DoWork()
 {
-}
-
-FEnhancedMultithreadedTask::~FEnhancedMultithreadedTask()
-{
-    bShuttingDown = true;
-    RequestStop();
-
-    // Quick attempt to stop gracefully
-    const double ShutdownTimeout = 0.5;
-    const double StartTime = FPlatformTime::Seconds();
-    
-    while (IsRunning() && (FPlatformTime::Seconds() - StartTime) < ShutdownTimeout)
+    while (!bShouldStop)
     {
-        FPlatformProcess::Sleep(0.001f);
-    }
-
-    if (Thread)
-    {
-        Thread->Kill(true);
-        delete Thread;
-        Thread = nullptr;
-    }
-}
-
-bool FEnhancedMultithreadedTask::Init()
-{
-    RunningCounter.Increment();
-    LastExecutionTime = FPlatformTime::Seconds();
-    return true;
-}
-
-uint32 FEnhancedMultithreadedTask::Run()
-{
-    static const double MinTimeBetweenExecutions = 0.016; // ~60 FPS cap
-    bool bHasExecutedOnce = false;
-    
-    // Get thread info
-    const uint32 ThreadId = FPlatformTLS::GetCurrentThreadId();
-    FString ThreadName = FString::Printf(TEXT("[SuperThreader] Worker Thread %u"), ThreadId);
-    
-    // Register thread name with OS
-    FPlatformProcess::SetThreadName(*ThreadName);
-    
-    // Register with thread manager if we have a valid thread
-    if (Thread)
-    {
-        FThreadManager::Get().AddThread(ThreadId, Thread);
-    }
-    
-    UE_LOG(LogSuperThreader, Log, TEXT("Thread started - Name: %s, ID: %u"), *ThreadName, ThreadId);
-    
-    while (!StopRequestedCounter.GetValue() && !bShuttingDown)
-    {
-        const double CurrentTime = FPlatformTime::Seconds();
-        const double TimeSinceLastExecution = CurrentTime - LastExecutionTime;
-
-        if (TimeSinceLastExecution >= MinTimeBetweenExecutions)
+        if (Work.IsBound())
         {
-            if (!bShuttingDown && WorkDelegate.IsBound())
-            {
-                WorkDelegate.Execute();
-                bHasExecutedOnce = true;
-
-                if (bRunOnce && bHasExecutedOnce)
-                {
-                    RequestStop();
-                    break;
-                }
-            }
-            
-            LastExecutionTime = CurrentTime;
+            Work.Execute();
         }
-        else
+
+        if (!bLooping)
         {
-            // Use a shorter sleep time to be more responsive
-            FPlatformProcess::Sleep(0.001f);
+            break;
         }
     }
+}
 
-    UE_LOG(LogSuperThreader, Log, TEXT("Thread ended - Name: %s, ID: %u"), *ThreadName, ThreadId);
-    
-    // Unregister from thread manager
-    if (Thread)
+void UMultithreadedLibrary::Initialize()
+{
+    if (!bIsInitialized)
     {
-        FThreadManager::Get().RemoveThread(Thread);
+        bIsInitialized = true;
+        UE_LOG(LogSuperThreader, Log, TEXT("SuperThreader initialized"));
     }
-    
-    RunningCounter.Decrement();
-    return 0;
 }
 
-void FEnhancedMultithreadedTask::Stop()
+void UMultithreadedLibrary::Shutdown()
 {
-    RequestStop();
-}
-
-void FEnhancedMultithreadedTask::Exit()
-{
-    bShuttingDown = true;
-}
-
-void FEnhancedMultithreadedTask::RequestStop()
-{
-    bShuttingDown = true;
-    StopRequestedCounter.Increment();
-}
-
-bool FEnhancedMultithreadedTask::IsRunning() const
-{
-    return RunningCounter.GetValue() > 0 && !bShuttingDown;
-}
-
-bool FEnhancedMultithreadedTask::IsCancelled() const
-{
-    return StopRequestedCounter.GetValue() > 0 || bShuttingDown;
-}
-
-int64 UMultithreadedLibrary::StartMultithreadedTask(const FThreadWorkDelegate& WorkFunction, bool bRunOnce)
-{
-    if (!WorkFunction.IsBound())
+    if (bIsInitialized)
     {
-        UE_LOG(LogSuperThreader, Warning, TEXT("StartMultithreadedTask: Work function not bound"));
+        StopAllThreads();
+        bIsInitialized = false;
+        UE_LOG(LogSuperThreader, Log, TEXT("SuperThreader shutdown"));
+    }
+}
+
+int32 UMultithreadedLibrary::StartThread(const FThreadWorkDelegate& Work, bool bLooping)
+{
+    if (!bIsInitialized)
+    {
+        Initialize();
+    }
+
+    if (!Work.IsBound())
+    {
+        UE_LOG(LogSuperThreader, Warning, TEXT("Cannot start thread: Work delegate not bound"));
         return -1;
     }
 
-    FEnhancedMultithreadedTask* Task = new FEnhancedMultithreadedTask(WorkFunction, bRunOnce);
-    
-    // Generate a unique task ID using high-resolution timer
-    int64 TaskId = static_cast<int64>(FPlatformTime::Seconds() * 1000000.0);
+    static int32 NextThreadId = 0;
+    const int32 ThreadId = ++NextThreadId;
 
-    // Create descriptive thread name
-    FString ThreadName = FString::Printf(TEXT("[SuperThreader] Task %lld"), TaskId);
+    FSuperThreadTask* Task = new FSuperThreadTask(Work, bLooping);
+    auto* AsyncTask = new FAutoDeleteAsyncTask<FSuperThreadTask>(*Task);
     
-    UE_LOG(LogSuperThreader, Log, TEXT("Creating thread: %s"), *ThreadName);
-
-    // Create and start the thread with custom name
-    uint32 StackSize = 128 * 1024; // 128KB stack
-    FRunnableThread* Thread = FRunnableThread::Create(
-        Task,
-        *ThreadName,
-        StackSize,
-        TPri_Normal,
-        FPlatformAffinity::GetNoAffinityMask()
-    );
-    
-    if (Thread)
     {
-        Task->SetThread(Thread);
-
-        // Safely add to active threads
-        FScopeLock Lock(&ThreadMapCriticalSection);
-        ActiveThreads.Add(TaskId, Task);
-        
-        UE_LOG(LogSuperThreader, Log, TEXT("Thread created successfully: %s (Total threads: %d)"), *ThreadName, ActiveThreads.Num());
-        return TaskId;
+        FScopeLock Lock(&TaskLock);
+        ActiveTasks.Add(ThreadId, FTaskInfo(Task, AsyncTask));
     }
-    else
+
+    AsyncTask->StartBackgroundTask();
+    UE_LOG(LogSuperThreader, Log, TEXT("Started thread %d"), ThreadId);
+
+    return ThreadId;
+}
+
+void UMultithreadedLibrary::StopThread(int32 ThreadId)
+{
+    FScopeLock Lock(&TaskLock);
+    
+    if (FTaskInfo* TaskInfo = ActiveTasks.Find(ThreadId))
     {
-        UE_LOG(LogSuperThreader, Error, TEXT("Failed to create thread: %s"), *ThreadName);
-        delete Task;
-        return -1;
+        if (TaskInfo->IsValid())
+        {
+            TaskInfo->Task->Stop();
+            ActiveTasks.Remove(ThreadId);
+            UE_LOG(LogSuperThreader, Log, TEXT("Stopped thread %d"), ThreadId);
+        }
     }
 }
 
-bool UMultithreadedLibrary::StopMultithreadedTask(int64 TaskId)
+void UMultithreadedLibrary::StopAllThreads()
 {
-    FEnhancedMultithreadedTask* TaskToStop = nullptr;
-    
+    FScopeLock Lock(&TaskLock);
+
+    for (auto& Pair : ActiveTasks)
     {
-        FScopeLock Lock(&ThreadMapCriticalSection);
-        if (FEnhancedMultithreadedTask** TaskPtr = ActiveThreads.Find(TaskId))
+        if (Pair.Value.IsValid())
         {
-            TaskToStop = *TaskPtr;
-            ActiveThreads.Remove(TaskId);
+            Pair.Value.Task->Stop();
         }
     }
 
-    if (TaskToStop)
-    {
-        TaskToStop->RequestStop();
-        delete TaskToStop;
-        return true;
-    }
-
-    return false;
+    ActiveTasks.Empty();
+    UE_LOG(LogSuperThreader, Log, TEXT("Stopped all threads"));
 }
 
-void UMultithreadedLibrary::StopAllTasks()
+bool UMultithreadedLibrary::IsThreadRunning(int32 ThreadId)
 {
-    TArray<int64> TaskIds;
-    
-    {
-        FScopeLock Lock(&ThreadMapCriticalSection);
-        ActiveThreads.GetKeys(TaskIds);
-    }
-    
-    // Stop all tasks
-    for (int64 TaskId : TaskIds)
-    {
-        StopMultithreadedTask(TaskId);
-    }
-}
-
-bool UMultithreadedLibrary::IsThreadRunning(int64 TaskId)
-{
-    FScopeLock Lock(&ThreadMapCriticalSection);
-    if (FEnhancedMultithreadedTask** TaskPtr = ActiveThreads.Find(TaskId))
-    {
-        return (*TaskPtr)->IsRunning();
-    }
-    return false;
+    FScopeLock Lock(&TaskLock);
+    const FTaskInfo* TaskInfo = ActiveTasks.Find(ThreadId);
+    return TaskInfo && TaskInfo->IsValid() && !TaskInfo->Task->IsStopped();
 }

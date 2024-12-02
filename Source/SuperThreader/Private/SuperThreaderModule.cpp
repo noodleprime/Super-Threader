@@ -1,16 +1,18 @@
 #include "SuperThreaderModule.h"
-#include "Modules/ModuleManager.h"
-#include "Stats/Stats.h"
-#include "Stats/Stats2.h"
+#include "MultithreadedLibrary.h"
 
-IMPLEMENT_MODULE(FSuperThreaderModule, SuperThreader);
+#define LOCTEXT_NAMESPACE "FSuperThreaderModule"
 
 void FSuperThreaderModule::StartupModule()
 {
-    // Stats will be initialized automatically when needed
+    UMultithreadedLibrary::Initialize();
 }
 
 void FSuperThreaderModule::ShutdownModule()
 {
-    // Stats will be cleaned up automatically
+    UMultithreadedLibrary::Shutdown();
 }
+
+#undef LOCTEXT_NAMESPACE
+	
+IMPLEMENT_MODULE(FSuperThreaderModule, SuperThreader)
