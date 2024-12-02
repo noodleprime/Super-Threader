@@ -1,0 +1,24 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "Super Threader",
+	"Description": "A flexible multithreading system with Blueprint support",
+	"Category": "Threading",
+	"CreatedBy": "noodleprime",
+	"CreatedByURL": "https://github.com/noodleprime",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "SuperThreader",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}
